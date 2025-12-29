@@ -8,6 +8,8 @@
   </tr>
 </table>
 
+**pretrained model**: https://huggingface.co/datasets/ianzyh/lerobot_smolvla
+
 ### Install Lerobot
 
 1. Install Miniconda For Ubuntu 22.04
