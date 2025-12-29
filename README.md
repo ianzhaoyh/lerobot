@@ -4,6 +4,7 @@
   <tr>
     <td><img src="README.assets/copy_6C803768-1E1B-486A-88D1-0A228691DF12.GIF" width="100%"></td>
     <td><img src="README.assets/copy_F91A24D3-1822-4DE4-A5F7-128146016C75.GIF" width="100%"></td>
+    <td> <img src="README.assets/copy_379A6F1F-AADE-41E4-9347-CEBC7F3045BF.GIF" width="100%"</td>
   </tr>
 </table>
 
