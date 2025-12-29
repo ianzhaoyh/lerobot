@@ -11,7 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+'''
+整体的思路,在现有VLM(SmolVLM)并联上一个“瘦版”LM expert(（降宽度但保留相同注意力头规格）)
+在每层把多个流的注意力拼接或做跨注意力，然后各自过残差+MLP，最后各自做层归一化
+支持两种注意力模式：
+self_attn：把各流的 Q/K/V 在序列维拼接，共同做一次注意力，再按各自切片回去。
+cross_attn：主流（VLM 文本）先自注意力生成 K/V，expert 用投影后的 K/V 做查询到跨注意力；可按 every-n-layers .com插混自注意力。
+支持 KV 缓存 prefill 和 decode 两阶段
+'''
 import copy
 
 import torch
@@ -19,15 +26,16 @@ from torch import nn
 from transformers import (
     AutoConfig,
     AutoModel,
-    AutoModelForImageTextToText,
-    AutoProcessor,
-    SmolVLMForConditionalGeneration,
+    AutoModelForImageTextToText, #加载完整的SmolVLM模型
+    AutoProcessor, # 用于后处理 / 预处理（图像 + 文本 tokenization），在这个类内部主要是为了统一接口。
+    SmolVLMForConditionalGeneration, #用于“纯配置初始化”时构建一个空的 SmolVLM
 )
 
 
 def apply_rope(x, positions, max_wavelength=10_000):
     """
     Applies RoPE positions [B, L] to x [B, L, H, D].
+    位置编码
     """
     d_half = x.shape[-1] // 2
     device = x.device
@@ -50,7 +58,7 @@ def apply_rope(x, positions, max_wavelength=10_000):
 
     return res.to(dtype)
 
-
+#按 Llama/Gemma 风格把 FFN 宽度设为近似 4/3×hidden_dim×4，再对齐到 multiple_of
 def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
     hidden_dim = int(2 * hidden_dim / 3)
     hidden_dim = int(ffn_dim_multiplier * hidden_dim)
@@ -61,7 +69,7 @@ def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
 class SmolVLMWithExpertModel(nn.Module):
     def __init__(
         self,
-        model_id: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+        model_id: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",  #默认从id加载SmolVLM2的完整权重
         load_vlm_weights: bool = True,
         train_expert_only: bool = True,
         freeze_vision_encoder: bool = False,
@@ -86,26 +94,40 @@ class SmolVLMWithExpertModel(nn.Module):
             config = AutoConfig.from_pretrained(model_id)
             self.vlm = SmolVLMForConditionalGeneration(config=config)
         self.processor = AutoProcessor.from_pretrained(model_id)
+        #可选裁剪VLM文本层数 
+        #把 VLM 的 text transformer 只保留前 num_vlm_layers 层 快速削减模型深度
         if num_vlm_layers > 0:
             print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
             self.get_vlm_model().text_model.layers = self.get_vlm_model().text_model.layers[:num_vlm_layers]
-        self.num_vlm_layers = len(self.get_vlm_model().text_model.layers)
+        self.num_vlm_layers = len(self.get_vlm_model().text_model.layers) #更新实际使用的文本层数
         self.config = config
-        # Smaller lm expert
+        # Smaller lm expert  构造瘦版LM expert配置
         lm_expert_config = copy.deepcopy(config.text_config)
         hidden_size = lm_expert_config.hidden_size
-        lm_expert_config.hidden_size = int(hidden_size * expert_width_multiplier)  # hidden_size // 2
+        #缩窄
+        lm_expert_config.hidden_size = int(hidden_size * expert_width_multiplier)  # hidden_size // 2 
+        #用刚才的get_intermediate_size 重新计算
         lm_expert_config.intermediate_size = get_intermediate_size(int(hidden_size * expert_width_multiplier))
-        lm_expert_config.num_hidden_layers = self.num_vlm_layers
+        lm_expert_config.num_hidden_layers = self.num_vlm_layers #默认让expert层数与VLM文本层数相同
         if num_expert_layers > 0:
             assert len(self.get_vlm_model().text_model.layers) % num_expert_layers == 0, (
                 f"Number of layers in the VLM {len(self.get_vlm_model().text_model.layers)} are not multiple of num_expert_layers {num_expert_layers}"
             )
             lm_expert_config.num_hidden_layers = num_expert_layers
         self.lm_expert = AutoModel.from_config(lm_expert_config)
-
+      #使用 AutoModel.from_config 构造一个“纯 transformer”的 expert 模型（没有 lm_head）
         self.num_expert_layers = len(self.lm_expert.layers)
         self.self_attn_every_n_layers = self_attn_every_n_layers
+    #cross 模式里，expert 的 K/V 来自 VLM 的 K/V（共享 prefix 信息）
+        '''
+    但是 VLM 的头数和 head_dim 可能和 expert 不一样，所以这里重写 expert 层里的 k_proj / v_proj：
+
+    输入维度是 “VLM 的 KV 维度”（num_key_value_heads * head_dim）。
+
+    输出维度是 “expert 的 KV 维度”。
+
+    当 self_attn_every_n_layers > 0 且当前层是 N 的倍数时，跳过改写，保持原本的 self-attn 行为（这些层不做 cross）。
+        '''
         if "cross" in attention_mode:
             # Reshape qkv projections to have the same input dimension as the vlm
             for layer_idx in range(len(self.lm_expert.layers)):
@@ -121,9 +143,12 @@ class SmolVLMWithExpertModel(nn.Module):
                     lm_expert_config.num_key_value_heads * lm_expert_config.head_dim,
                     bias=lm_expert_config.attention_bias,
                 )
+ #expert 不需要自己的 embedding（你用 VLM 的 text embedding 作为输入），
+ #所以把 embed_tokens 去掉，节省参数和避免误用
+ #保存一些重要配置（头数、KV 头数、是否只训练 expert、注意力模式等）。
+ #调用 set_requires_grad() 控制哪些参数是可训练的。
         # Remove unused embed_tokens
         self.lm_expert.embed_tokens = None
-
         self.num_attention_heads = self.config.text_config.num_attention_heads
         self.num_key_value_heads = self.config.text_config.num_key_value_heads
 
