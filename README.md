@@ -9,6 +9,7 @@
 </table>
 
 **pretrained model**: https://huggingface.co/datasets/ianzyh/lerobot_smolvla
+Demo:https://drive.google.com/drive/folders/1XtiAh4Ak8ezBG4QkrtHqUryQVfIgapCS?usp=sharing
 
 ### Install Lerobot
 
