@@ -8,7 +8,7 @@
   </tr>
 </table>
 
-**pretrained model**: https://huggingface.co/datasets/ianzyh/lerobot_smolvla
+**pretrained model**: https://huggingface.co/ianzyh/SmolVLA_GRAB_PUT/tree/main
 Demo:https://drive.google.com/drive/folders/1XtiAh4Ak8ezBG4QkrtHqUryQVfIgapCS?usp=sharing
 
 ### Install Lerobot
